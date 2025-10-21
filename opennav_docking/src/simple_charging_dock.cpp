@@ -35,6 +35,8 @@ void SimpleChargingDock::configure(
   // Optionally use battery info to check when charging, else say charging if docked
   nav2_util::declare_parameter_if_not_declared(
     node_, name + ".use_battery_status", rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name + ".use_dock_status", rclcpp::ParameterValue(true));
 
   // Parameters for optional external detection of dock pose
   nav2_util::declare_parameter_if_not_declared(
@@ -79,6 +81,7 @@ void SimpleChargingDock::configure(
     node_, name + ".staging_yaw_offset", rclcpp::ParameterValue(0.0));
 
   node_->get_parameter(name + ".use_battery_status", use_battery_status_);
+  node_->get_parameter(name + ".use_dock_status", use_dock_status_);
   node_->get_parameter(name + ".use_external_detection_pose", use_external_detection_pose_);
   node_->get_parameter(name + ".external_detection_timeout", external_detection_timeout_);
   node_->get_parameter(
@@ -103,11 +106,43 @@ void SimpleChargingDock::configure(
   node_->get_parameter(name + ".filter_coef", filter_coef);
   filter_ = std::make_unique<PoseFilter>(filter_coef, external_detection_timeout_);
 
+
+  RCLCPP_WARN(node_->get_logger(),
+    "\n\t use_battery_status: %s" \
+    "\n\t charging_threshold: %.2f" \
+    "\n\t    use_dock_status: %s"\
+    "\n\t   staging_x_offset: %.2f" \
+    "\n\t staging_yaw_offset: %.2f",
+    (use_battery_status_ ? "true" : "false"),
+    charging_threshold_,
+    (use_dock_status_ ? "true" : "false"),
+    staging_x_offset_,
+    staging_yaw_offset_
+  );
+
+  auto qos_best_effort = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
   if (use_battery_status_) {
     battery_sub_ = node_->create_subscription<sensor_msgs::msg::BatteryState>(
-      "battery_state", 1,
+      "battery_state", qos_best_effort,
       [this](const sensor_msgs::msg::BatteryState::SharedPtr state) {
-        is_charging_ = state->current > charging_threshold_;
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+          "current: %.2f, charging_threshold: %.2f, percentage: %.2f",
+          state->current, charging_threshold_, state->percentage
+        );
+
+        is_charging_ = (state->current > charging_threshold_);
+      });
+  }
+
+  if (use_dock_status_) {
+    dock_status_sub_ = node_->create_subscription<irobot_create_msgs::msg::DockStatus>(
+      "dock_status", qos_best_effort,
+      [this](const irobot_create_msgs::msg::DockStatus::SharedPtr status) {
+        is_docked_ = status->is_docked;
+        // RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        //   "is_docked: %s",
+        //   (is_docked_ ? "true" : "false")
+        // );
       });
   }
 
@@ -137,6 +172,54 @@ void SimpleChargingDock::configure(
   filtered_dock_pose_pub_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>(
     "filtered_dock_pose", 1);
   staging_pose_pub_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>("staging_pose", 1);
+
+  if (enable_diag_) {
+    diag_publisher_ = node_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+      diag_topic_name_, 5);
+    diag_timer_ = node_->create_wall_timer(
+      std::chrono::milliseconds(1000),
+      std::bind(&SimpleChargingDock::diagTimerCallback, this));
+  }
+}
+
+void SimpleChargingDock::diagTimerCallback() {
+  if (enable_diag_ && diag_publisher_) {
+
+    auto pub_diag = [this](bool charging_stat) {
+      // https://docs.ros.org/en/noetic/api/diagnostic_msgs/html/msg/DiagnosticStatus.html
+      auto msg = std::make_unique<diagnostic_msgs::msg::DiagnosticArray>();
+      msg->header.stamp = node_->now();
+      diagnostic_msgs::msg::DiagnosticStatus status;
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      status.name = node_->get_name();
+      status.message = "Robot";
+      status.hardware_id = "";
+      {
+        diagnostic_msgs::msg::KeyValue value;
+        value.key = "state";
+        value.value = charging_stat ? "Charging" : "UnCharging";
+        status.values.push_back(value);
+      }
+      msg->status.push_back(status);
+      diag_publisher_->publish(std::move(msg));
+    };
+      
+    static bool last_charging_stat = isCharging();
+    static std::once_flag call_once_status;
+    std::call_once(call_once_status, [&]() {
+      RCLCPP_INFO(node_->get_logger(), "Charging status: %s",
+        (last_charging_stat ? "Charging" : "UnCharging"));
+      pub_diag(last_charging_stat);
+    });
+    if (last_charging_stat != isCharging()) {
+      RCLCPP_INFO(node_->get_logger(), "Charging status from %s to %s",
+        (last_charging_stat ? "Charging" : "UnCharging"),
+        (isCharging() ? "Charging" : "UnCharging")
+      );
+      last_charging_stat = isCharging();
+      pub_diag(last_charging_stat);
+    }
+  }
 }
 
 geometry_msgs::msg::PoseStamped SimpleChargingDock::getStagingPose(
@@ -238,6 +321,10 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
 
 bool SimpleChargingDock::isDocked()
 {
+  if (use_dock_status_) {
+    return is_docked_;
+  }
+
   if (joint_state_sub_) {
     // Using stall detection
     return is_stalled_;
@@ -268,6 +355,13 @@ bool SimpleChargingDock::isDocked()
 
 bool SimpleChargingDock::isCharging()
 {
+  // RCLCPP_INFO_THROTTLE(node_->get_logger(),  *node_->get_clock(), 1000,
+  //   "use_battery_status: %s, is_charging: %s, isDocked: %s",
+  //   (use_battery_status_ ? "true" : "false"),
+  //   (is_charging_ ? "true" : "false"),
+  //   (isDocked() ? "true" : "false")
+  // );
+
   return use_battery_status_ ? is_charging_ : isDocked();
 }
 

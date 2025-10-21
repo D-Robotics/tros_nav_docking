@@ -85,4 +85,11 @@ void Navigator::goToPose(
   throw opennav_docking_core::FailedToStage("Navigation request to staging pose failed.");
 }
 
+void Navigator::cancel() {
+  if (nav_to_pose_client_ && nav_to_pose_client_->action_server_is_ready()) {
+    RCLCPP_WARN(node_.lock()->get_logger(), "Cancelling navigation goal...");
+    nav_to_pose_client_->async_cancel_all_goals();
+  }
+}
+
 }  // namespace opennav_docking

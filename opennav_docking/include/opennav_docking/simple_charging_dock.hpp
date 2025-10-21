@@ -25,6 +25,9 @@
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2/utils.h"
 
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "irobot_create_msgs/msg/dock_status.hpp"
+
 #include "opennav_docking_core/charging_dock.hpp"
 #include "opennav_docking/pose_filter.hpp"
 
@@ -121,6 +124,9 @@ protected:
   rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr battery_sub_;
   bool is_charging_;
   bool use_battery_status_;
+  rclcpp::Subscription<irobot_create_msgs::msg::DockStatus>::SharedPtr dock_status_sub_;
+  bool use_dock_status_;
+  bool is_docked_ = false;
 
   // Optionally subscribe to joint state message, used to determine if stalled
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
@@ -149,6 +155,13 @@ protected:
 
   rclcpp_lifecycle::LifecycleNode::SharedPtr node_;
   std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
+  
+  rclcpp::TimerBase::SharedPtr diag_timer_ = nullptr;
+  void diagTimerCallback();
+  bool enable_diag_ = true;
+  std::string diag_topic_name_ = "/tros_diagnostics";
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_publisher_ = nullptr;
+
 };
 
 }  // namespace opennav_docking

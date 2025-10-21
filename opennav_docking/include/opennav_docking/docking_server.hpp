@@ -25,6 +25,9 @@
 #include "nav2_util/node_utils.hpp"
 #include "nav2_util/simple_action_server.hpp"
 #include "nav_2d_utils/odom_subscriber.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "opennav_docking/controller.hpp"
 #include "opennav_docking/utils.hpp"
 #include "opennav_docking/types.hpp"
@@ -32,6 +35,9 @@
 #include "opennav_docking/navigator.hpp"
 #include "opennav_docking_core/charging_dock.hpp"
 #include "tf2_ros/transform_listener.h"
+#include "yaml-cpp/yaml.h"
+#include "nav2_util/geometry_utils.hpp"
+#include "angles/angles.h"
 
 namespace opennav_docking
 {
@@ -257,6 +263,8 @@ protected:
   // Angular tolerance to exit the rotation loop when rotate_to_dock is enabled
   double rotation_angular_tolerance_;
 
+  double backward_projection_ = 0.25;
+
   // This is a class member so it can be accessed in publish feedback
   rclcpp::Time action_start_time_;
 
@@ -266,13 +274,75 @@ protected:
   std::unique_ptr<DockingActionServer> docking_action_server_;
   std::unique_ptr<UndockingActionServer> undocking_action_server_;
 
+  std::string docking_start_stop_topic_ = "docking/start_stop";
+  std::string undocking_start_stop_topic_ = "undocking/start_stop";
+  std::string docking_status_topic_ = "docking/status";
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr docking_start_stop_sub_ = nullptr;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr undocking_start_stop_sub_ = nullptr;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr docking_status_pub_ = nullptr;
+
+  enum class DockingRequestType {
+    UNKNOWN = 0,
+    TOPIC,
+    ACTION
+  };
+  DockingRequestType current_docking_request_type_ = DockingRequestType::UNKNOWN;
+
+  void publishDockingStatus(std::string status);
+
+  void dockingStartStopCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void undockingStartStopCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  std::mutex docking_mutex_;
+  enum class DockingActionState {
+    IDLE = 0,
+    DOCKING,
+    UNDOCKING
+  };
+  DockingActionState docking_action_state_ = DockingActionState::IDLE;
+  std::atomic<bool> docking_continue_ = true;
+  std::shared_ptr<std::thread> docking_thread_ = nullptr;
+  void doDocking();
+  void doUndocking();
+  float max_undocking_time_ = 10.0;
+  std::string dock_charged_pose_topic_ = "docking/charged_pose";
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dock_charged_pose_pub_ = nullptr;
+  rclcpp::TimerBase::SharedPtr pub_timer_ = nullptr;
+  void publishDockChargedPose();
+
+  rclcpp::Time dock_approach_start_time_;
+  int dock_approach_wise_ = 1;
+  geometry_msgs::msg::Twist rotateToApproach(const geometry_msgs::msg::PoseStamped & dock_pose,
+    const geometry_msgs::msg::PoseStamped & robot_pose,
+    float angular_vel, float max_rotation_time, float yaw_tolerance);
+
+  bool navigate_to_staging_pose_ = true;
+  float max_staging_time_ = 1000.0;
+
   std::unique_ptr<DockDatabase> dock_db_;
+  std::shared_ptr<Dock> dock_;
   std::unique_ptr<Navigator> navigator_;
   std::unique_ptr<Controller> controller_;
   std::string curr_dock_type_;
 
   std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf2_listener_;
+  
+  bool enable_diag_ = true;
+  std::string diag_topic_name_ = "/tros_diagnostics";
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_publisher_ = nullptr;
+  void publishDiagnostics(std::string diag_val);
+  
+private:
+  enum class DockingState {
+    UNKNOWN,
+    DOCKING,
+    UNDOCKING
+  };
+  DockingState current_docking_state_ = DockingState::UNKNOWN;
+  geometry_msgs::msg::PoseStamped initial_dock_pose_;
+  std::string dock_yaml_filepath_ = "dock.yaml";
+  bool loadDockPose();
+  bool saveDockPose();
 };
 
 }  // namespace opennav_docking

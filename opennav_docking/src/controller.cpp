@@ -105,6 +105,15 @@ Controller::Controller(
 
   trajectory_pub_ =
     node->create_publisher<nav_msgs::msg::Path>("docking_trajectory", 1);
+    
+  RCLCPP_WARN(logger_,
+    "\n\t   v_linear_min: %.3f" \
+    "\n\t   v_linear_max: %.3f" \
+    "\n\t  v_angular_max: %.3f",
+    v_linear_min_,
+    v_linear_max_,
+    v_angular_max_);
+
 }
 
 Controller::~Controller()
@@ -274,9 +283,11 @@ Controller::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
       }
 
       // Update the smooth control law with the new params
-      control_law_->setCurvatureConstants(k_phi_, k_delta_, beta_, lambda_);
-      control_law_->setSlowdownRadius(slowdown_radius_);
-      control_law_->setSpeedLimit(v_linear_min_, v_linear_max_, v_angular_max_);
+      if (control_law_) {
+        control_law_->setCurvatureConstants(k_phi_, k_delta_, beta_, lambda_);
+        control_law_->setSlowdownRadius(slowdown_radius_);
+        control_law_->setSpeedLimit(v_linear_min_, v_linear_max_, v_angular_max_);
+      }
     }
   }
 

@@ -74,11 +74,14 @@ public:
     const rclcpp::Duration & max_staging_duration,
     bool recursed = false);
 
+  void cancel();
+
 protected:
   rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::executors::SingleThreadedExecutor executor_;
   ActionClient::SharedPtr nav_to_pose_client_;
+
   std::string navigator_bt_xml_;
 };
 
