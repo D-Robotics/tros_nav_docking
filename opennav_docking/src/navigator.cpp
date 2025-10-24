@@ -54,6 +54,10 @@ void Navigator::goToPose(
   const rclcpp::Duration & max_staging_duration,
   bool recursed)
 {
+  if (!nav_to_pose_client_) {
+    throw std::runtime_error("Navigator action client not initialized.");
+  }
+
   Nav2Pose::Goal goal;
   goal.pose = pose;
   goal.behavior_tree = navigator_bt_xml_;

@@ -80,7 +80,7 @@ protected:
   rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::executors::SingleThreadedExecutor executor_;
-  ActionClient::SharedPtr nav_to_pose_client_;
+  ActionClient::SharedPtr nav_to_pose_client_ = nullptr;
 
   std::string navigator_bt_xml_;
 };

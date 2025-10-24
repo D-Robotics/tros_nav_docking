@@ -138,6 +138,9 @@ public:
    */
   virtual geometry_msgs::msg::PoseStamped getRobotPoseInFrame(const std::string & frame);
 
+  virtual geometry_msgs::msg::PoseStamped getRobotPoseInFrame(
+    const std::string & frame, const rclcpp::Time & t);
+
   /**
    * @brief Gets a preempted goal if immediately requested
    * @param Goal goal to check or replace if required with preemption
@@ -340,7 +343,7 @@ private:
   };
   DockingState current_docking_state_ = DockingState::UNKNOWN;
   geometry_msgs::msg::PoseStamped initial_dock_pose_;
-  std::string dock_yaml_filepath_ = "dock.yaml";
+  std::string dock_yaml_filepath_ = "tros_dock.yaml";
   bool loadDockPose();
   bool saveDockPose();
 };

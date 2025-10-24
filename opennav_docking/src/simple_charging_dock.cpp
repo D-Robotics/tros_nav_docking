@@ -14,7 +14,9 @@
 
 #include <cmath>
 
+#include "angles/angles.h"
 #include "nav2_util/node_utils.hpp"
+#include "nav2_util/geometry_utils.hpp"
 #include "opennav_docking/simple_charging_dock.hpp"
 
 namespace opennav_docking
@@ -106,18 +108,28 @@ void SimpleChargingDock::configure(
   node_->get_parameter(name + ".filter_coef", filter_coef);
   filter_ = std::make_unique<PoseFilter>(filter_coef, external_detection_timeout_);
 
+  detected_dock_pose_topic_ = node_->declare_parameter(name + ".detected_dock_pose_topic", detected_dock_pose_topic_);
+
 
   RCLCPP_WARN(node_->get_logger(),
     "\n\t use_battery_status: %s" \
     "\n\t charging_threshold: %.2f" \
     "\n\t    use_dock_status: %s"\
     "\n\t   staging_x_offset: %.2f" \
-    "\n\t staging_yaw_offset: %.2f",
+    "\n\t staging_yaw_offset: %.2f" \
+    "\n\t      use_external_detection_pose: %s" \
+    "\n\t       external_detection_timeout: %.2f" \
+    "\n\t external_detection_translation_x: %.2f" \
+    "\n\t external_detection_translation_y: %.2f",
     (use_battery_status_ ? "true" : "false"),
     charging_threshold_,
     (use_dock_status_ ? "true" : "false"),
     staging_x_offset_,
-    staging_yaw_offset_
+    staging_yaw_offset_,
+    (use_external_detection_pose_ ? ("true with topic '" + detected_dock_pose_topic_ + "'") : "false").data(),
+    external_detection_timeout_,
+    external_detection_translation_x_,
+    external_detection_translation_y_
   );
 
   auto qos_best_effort = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
@@ -149,9 +161,62 @@ void SimpleChargingDock::configure(
   if (use_external_detection_pose_) {
     dock_pose_.header.stamp = rclcpp::Time(0);
     dock_pose_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
-      "detected_dock_pose", 1,
+      detected_dock_pose_topic_, 1,
       [this](const geometry_msgs::msg::PoseStamped::SharedPtr pose) {
+        // RCLCPP_WARN_ONCE(node_->get_logger(), "Received dock pose from topic '%s', this msg appears only once",
+        //   detected_dock_pose_topic_.c_str());
+        // RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+        //   "Received detected dock pose from topic '%s', pose: (%.2f, %.2f, %.2f), yaw: %.2f, frame: %s",
+        //   detected_dock_pose_topic_.c_str(),
+        //   pose->pose.position.x,
+        //   pose->pose.position.y,
+        //   pose->pose.position.z,
+        //   angles::to_degrees(tf2::getYaw(pose->pose.orientation)),
+        //   pose->header.frame_id.data()
+        // );
+
         detected_dock_pose_ = *pose;
+        
+        geometry_msgs::msg::PoseStamped pose_odom = detected_dock_pose_;
+        try {
+          tf2_buffer_->transform(pose_odom, pose_odom, "odom");
+          RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+            "Received detected dock pose from topic '%s', pose: (%.2f, %.2f, %.2f), yaw: %.2f, frame: %s",
+            detected_dock_pose_topic_.c_str(),
+            pose_odom.pose.position.x,
+            pose_odom.pose.position.y,
+            pose_odom.pose.position.z,
+            angles::to_degrees(tf2::getYaw(pose_odom.pose.orientation)),
+            pose_odom.header.frame_id.data()
+          );
+        } catch (const tf2::TransformException & ex) {
+          RCLCPP_WARN(node_->get_logger(), "Failed to transform detected dock pose");
+        }
+
+        
+        geometry_msgs::msg::PoseStamped robot_pose;
+        robot_pose.header.frame_id = "base_link";
+        robot_pose.header.stamp = pose_odom.header.stamp;
+        if (tf2_buffer_) {
+          try
+          {
+            tf2_buffer_->transform(robot_pose, robot_pose, "odom");
+            auto dist = nav2_util::geometry_utils::euclidean_distance(pose_odom, robot_pose);
+              
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+              "dist of dock with robot: %.2f", dist
+            );
+            
+          }
+          catch(const std::exception& e)
+          {
+            std::cerr << e.what() << '\n';
+            RCLCPP_ERROR(node_->get_logger(), "Failed to get robot pose with frame 'odom'");
+          }
+        }
+
+
+
       });
   }
 
@@ -265,8 +330,13 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   // Validate that external pose is new enough
   auto timeout = rclcpp::Duration::from_seconds(external_detection_timeout_);
   if (node_->now() - detected.header.stamp > timeout) {
-    RCLCPP_WARN(node_->get_logger(), "Lost detection or did not detect: timeout exceeded");
-    return false;
+    RCLCPP_WARN(node_->get_logger(),
+      "Lost detection or did not detect: timeout (%.2f sec) exceeded, using default dock pose", external_detection_timeout_);
+    // return false;
+    // TODO
+    dock_pose_pub_->publish(pose);
+    dock_pose_ = pose;
+    return true;
   }
 
   // Transform detected pose into fixed frame. Note that the argument pose
@@ -292,16 +362,23 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   detected = filter_->update(detected);
   filtered_dock_pose_pub_->publish(detected);
 
-  // Rotate the just the orientation, then remove roll/pitch
-  geometry_msgs::msg::PoseStamped just_orientation;
-  just_orientation.pose.orientation = tf2::toMsg(external_detection_rotation_);
-  geometry_msgs::msg::TransformStamped transform;
-  transform.transform.rotation = detected.pose.orientation;
-  tf2::doTransform(just_orientation, just_orientation, transform);
+  dock_pose_ = detected;
+  // // Publish & return dock pose for debugging purposes
+  // dock_pose_pub_->publish(dock_pose_);
+  // pose = dock_pose_;
+  // return true;
 
-  tf2::Quaternion orientation;
-  orientation.setEuler(0.0, 0.0, tf2::getYaw(just_orientation.pose.orientation));
-  dock_pose_.pose.orientation = tf2::toMsg(orientation);
+
+  // Rotate the just the orientation, then remove roll/pitch
+  // geometry_msgs::msg::PoseStamped just_orientation;
+  // just_orientation.pose.orientation = tf2::toMsg(external_detection_rotation_);
+  // geometry_msgs::msg::TransformStamped transform;
+  // transform.transform.rotation = detected.pose.orientation;
+  // tf2::doTransform(just_orientation, just_orientation, transform);
+
+  // tf2::Quaternion orientation;
+  // orientation.setEuler(0.0, 0.0, tf2::getYaw(just_orientation.pose.orientation));
+  // dock_pose_.pose.orientation = tf2::toMsg(orientation);
 
   // Construct dock_pose_ by applying translation/rotation
   dock_pose_.header = detected.header;
@@ -343,6 +420,7 @@ bool SimpleChargingDock::isDocked()
   try {
     tf2_buffer_->transform(base_pose, base_pose, dock_pose_.header.frame_id);
   } catch (const tf2::TransformException & ex) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to transform base pose");
     return false;
   }
 

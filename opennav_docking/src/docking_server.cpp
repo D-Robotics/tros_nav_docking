@@ -374,6 +374,7 @@ void DockingServer::dockingStartStopCallback(const std_msgs::msg::Bool::SharedPt
           doDocking();
           docking_action_state_ = DockingActionState::IDLE;
           RCLCPP_INFO(get_logger(), "docking thread stop");
+          publishDockingStatus("IDLE");
           publishDockingStatus("docking completed");
         });
       }
@@ -385,8 +386,10 @@ void DockingServer::dockingStartStopCallback(const std_msgs::msg::Bool::SharedPt
         publishDockingStatus("cancel docking");
         navigator_->cancel();
         docking_action_state_ = DockingActionState::IDLE;
+        publishDockingStatus("IDLE");
         publishDockingStatus("cancel completed");
       } else {
+        RCLCPP_INFO(get_logger(), "Robot is not docking, skip docking stop");
         return;
       }
     }
@@ -421,6 +424,7 @@ void DockingServer::undockingStartStopCallback(const std_msgs::msg::Bool::Shared
           doUndocking();
           docking_action_state_ = DockingActionState::IDLE;
           RCLCPP_INFO(get_logger(), "undocking thread stop");
+          publishDockingStatus("IDLE");
           publishDockingStatus("undocking completed");
         });
       }
@@ -431,6 +435,7 @@ void DockingServer::undockingStartStopCallback(const std_msgs::msg::Bool::Shared
         RCLCPP_INFO(get_logger(), "cancel undocking");
         docking_continue_ = false;
         docking_action_state_ = DockingActionState::IDLE;
+        publishDockingStatus("IDLE");
         publishDockingStatus("cancel completed");
       } else {
         return;
@@ -464,11 +469,19 @@ void DockingServer::doDocking() {
     {
       RCLCPP_INFO(get_logger(), "Robot already within pre-staging pose tolerance for dock");
     } else {
+      auto dist_dock2staging = nav2_util::geometry_utils::euclidean_distance(initial_dock_pose_, initial_staging_pose);
+      auto dist_dock2robot = nav2_util::geometry_utils::euclidean_distance(initial_dock_pose_, robot_pose);
+      
       RCLCPP_INFO(
         get_logger(),
-        "initial_staging_pose (%0.2f, %0.2f), dist of robot with initial staging_pose: %.2f, navigation to staging pose.",
+        "navigation to staging pose" \
+        "\n initial_staging_pose (%0.2f, %0.2f)" \
+        "\n dist of robot with initial staging_pose: %.2f" \
+        "\n  dist of dock with initial staging_pose: %.2f" \
+        "\n                 dist of robot with dock: %.2f",
         initial_staging_pose.pose.position.x, initial_staging_pose.pose.position.y,
-        nav2_util::geometry_utils::euclidean_distance(initial_staging_pose, robot_pose)
+        nav2_util::geometry_utils::euclidean_distance(initial_staging_pose, robot_pose),
+        dist_dock2staging, dist_dock2robot
       );
 
       navigator_->goToPose(
@@ -514,6 +527,7 @@ void DockingServer::doDocking() {
         if (approachDock(dock, dock_pose)) {
           // We are docked, wait for charging to begin
           RCLCPP_INFO(get_logger(), "Made contact with dock, waiting for charge to start");
+          publishZeroVelocity();
           if (waitForCharge(dock)) {
             RCLCPP_INFO(get_logger(), "Robot is charging!");
             result->success = true;
@@ -657,7 +671,13 @@ void DockingServer::doUndocking() {
       geometry_msgs::msg::PoseStamped robot_pose = getRobotPoseInFrame(staging_pose.header.frame_id);
       auto dist = nav2_util::geometry_utils::euclidean_distance(robot_pose, staging_pose);
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-        "dist of robot with staging_pose: %.2f", dist);
+        "dist of robot with staging_pose: %.2f, staging_pose: (%.2f, %.2f, %.2f), yaw: %.2f",
+        dist,
+        staging_pose.pose.position.x,
+        staging_pose.pose.position.y,
+        staging_pose.pose.position.z,
+        angles::to_degrees(tf2::getYaw(staging_pose.pose.orientation))
+      );
         
       // Get command to approach staging pose
       geometry_msgs::msg::Twist command;
@@ -961,8 +981,15 @@ void DockingServer::rotateToDock(const geometry_msgs::msg::PoseStamped & dock_po
 bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & dock_pose)
 {
   rclcpp::Rate loop_rate(controller_frequency_);
+  rclcpp::Rate rotate_ctrl_rate(2 * controller_frequency_);
   auto start = this->now();
+  auto start_rotate_tp = this->now();
   auto timeout = rclcpp::Duration::from_seconds(dock_approach_timeout_);
+  
+  float rotate_timeout_sec = 5.0;
+  auto rotate_timeout = rclcpp::Duration::from_seconds(rotate_timeout_sec);
+  
+  float move_progress_timeout = 2.0;
   
   RCLCPP_INFO(get_logger(),
     "dock_approach_timeout: %.2f, dock_pose frame_id: %s",
@@ -973,6 +1000,8 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
   geometry_msgs::msg::PoseStamped last_robot_pose = getRobotPoseInFrame(dock_pose.header.frame_id);
 
   bool rotate_to_approach = false;
+  bool reapproach = false;
+  geometry_msgs::msg::PoseStamped reapproach_robot_pose;
 
   while (rclcpp::ok()) {
     if (!docking_continue_)
@@ -983,6 +1012,9 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
     }
     
     // Stop and report success if connected to dock
+    if (rotate_to_approach) {
+      publishZeroVelocity();
+    }
     if (dock->plugin->isDocked() || dock->plugin->isCharging()) {
       RCLCPP_INFO(get_logger(),
         "robot is docked or in charging");
@@ -1010,21 +1042,51 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
 
     geometry_msgs::msg::PoseStamped robot_pose = getRobotPoseInFrame(dock_pose.header.frame_id);
 
+    if (reapproach) {
+      auto dist = nav2_util::geometry_utils::euclidean_distance(robot_pose, reapproach_robot_pose);
+      if (dist < 0.2) {
+        geometry_msgs::msg::Twist command;
+        command.linear.x = -0.05;
+        command.linear.y = 0;
+        command.angular.z = 0;
+        RCLCPP_INFO(get_logger(),
+          "move backward to reapproach dock" \
+          "\n dist: %.2f" \
+          "\n vel command: %.2f %.2f %.2f",
+          dist,
+          command.linear.x, command.linear.y, command.angular.z);
+        vel_publisher_->publish(command);
+        loop_rate.sleep();
+        continue;
+      } else {
+        RCLCPP_INFO(get_logger(),
+          "move backward completed");
+        publishZeroVelocity();
+        reapproach = false;
+        continue;
+      }
+    }
+
     if (rotate_to_approach) {
       auto command = rotateToApproach(dock_pose, robot_pose,
-        0.03, 3.0, angles::from_degrees(10));
+        0.01, 3.0, angles::from_degrees(3));
       // RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 100,
       RCLCPP_INFO(get_logger(),
-        "rotate_to_approach" \
-        "\n vel command: %.2f %.2f %.2f",
+        "rotate to approach, vel command: %.2f %.2f %.2f",
         command.linear.x, command.linear.y, command.angular.z);
       vel_publisher_->publish(command);
-      if (this->now() - start > timeout) {
-        RCLCPP_WARN(get_logger(), "approach dock timeout: %.2f", dock_approach_timeout_);
-        throw opennav_docking_core::FailedToControl(
-                "Timed out approaching dock; dock nor charging detected");
+
+      if (this->now() - start_rotate_tp > rotate_timeout) {
+        RCLCPP_WARN(get_logger(), "rotate to approach dock timeout: %.2f", rotate_timeout_sec);
+        reapproach = true;
+        reapproach_robot_pose = robot_pose;
+        rotate_to_approach = false;
+        publishZeroVelocity();
+        continue;
+        // throw opennav_docking_core::FailedToControl(
+        //         "Timed out approaching dock; dock nor charging detected");
       }
-      loop_rate.sleep();
+      rotate_ctrl_rate.sleep();
       continue;
     }
     
@@ -1064,10 +1126,27 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
     }
     
     dist = nav2_util::geometry_utils::euclidean_distance(robot_pose, dock_pose);
+    if (dist <= 0.05) {
+      command.linear.x = 0.01;
+    }
     RCLCPP_INFO(get_logger(),
+      "Approaching dock:" \
       "\n robot with dock dist: %.2f" \
-      "\n vel command: %.2f %.2f %.2f",
+      "\n           robot_pose: (%.2f, %.2f, %.2f), yaw degree: %.2f, frame: %s" \
+      "\n            dock_pose: (%.2f, %.2f, %.2f), yaw degree: %.2f, frame: %s" \
+      "\n          vel command: %.2f %.2f %.2f",
       dist,
+      robot_pose.pose.position.x,
+      robot_pose.pose.position.y,
+      robot_pose.pose.position.z,
+      angles::to_degrees(tf2::getYaw(robot_pose.pose.orientation)),
+      robot_pose.header.frame_id.data(),
+
+      dock_pose.pose.position.x,
+      dock_pose.pose.position.y,
+      dock_pose.pose.position.z,
+      angles::to_degrees(tf2::getYaw(dock_pose.pose.orientation)),
+      dock_pose.header.frame_id.data(),
       command.linear.x, command.linear.y, command.angular.z);
 
     // 如果robot和dock之间距离小于阈值，且robot长时间位置没有变化，控制robot只旋转
@@ -1086,21 +1165,21 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
     //   command = rotateToApproach(dock_pose, robot_pose,
     //     0.03, 3.0, angles::from_degrees(30));
     // }
-    float time_thr = 2;
     if (
         (rclcpp::Time(robot_pose.header.stamp).seconds() -
-        rclcpp::Time(last_robot_pose.header.stamp).seconds() >= time_thr)) {
+        rclcpp::Time(last_robot_pose.header.stamp).seconds() >= move_progress_timeout)) {
       // RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 100,
       //   "robot did not move for more than 1 sec, only rotate");
       RCLCPP_WARN(get_logger(),
-        "robot did not move for more than %.2f sec, only rotate", time_thr);
+        "robot did not move for more than %.2f sec, only rotate", move_progress_timeout);
       // rotating controller
       command = rotateToApproach(dock_pose, robot_pose,
-        0.03, 3.0, angles::from_degrees(10));
+        0.01, 3.0, angles::from_degrees(3));
       rotate_to_approach = true;
+      start_rotate_tp = this->now();
     }
 
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 100,
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
       "vel command: %.2f %.2f %.2f",
       command.linear.x, command.linear.y, command.angular.z);
     vel_publisher_->publish(command);
@@ -1122,12 +1201,13 @@ bool DockingServer::waitForCharge(Dock * dock)
   auto start = this->now();
   auto timeout = rclcpp::Duration::from_seconds(wait_charge_timeout_);
   auto uncharging_tp = this->now();
+  float docking_serial_time = 1.0;
   while (rclcpp::ok()) {
     publishDockingFeedback(DockRobot::Feedback::WAIT_FOR_CHARGE);
 
     if (dock->plugin->isCharging()) {
-      if (this->now().seconds() - uncharging_tp.seconds() >= 0.5) {
-        RCLCPP_INFO(get_logger(), "Robot is charging for 0.5 seconds");
+      if (this->now().seconds() - uncharging_tp.seconds() >= docking_serial_time) {
+        RCLCPP_INFO(get_logger(), "Robot is charging for %.2f seconds", docking_serial_time);
         return true;
       } else {
         loop_rate.sleep();
@@ -1204,6 +1284,9 @@ bool DockingServer::getCommandToPose(
     nav2_util::geometry_utils::euclidean_distance(robot_pose, pose);
   const double yaw = angles::shortest_angular_distance(
     tf2::getYaw(robot_pose.pose.orientation), tf2::getYaw(pose.pose.orientation));
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+    "distance of robot with dest: %.2f, linear_tolerance: %.2f, yaw: %.2f, angular_tolerance: %.2f",
+    dist, linear_tolerance, yaw, angular_tolerance);
   if (dist < linear_tolerance && abs(yaw) < angular_tolerance) {
     return true;
   }
@@ -1372,9 +1455,41 @@ geometry_msgs::msg::PoseStamped DockingServer::getRobotPoseInFrame(const std::st
   geometry_msgs::msg::PoseStamped robot_pose;
   robot_pose.header.frame_id = base_frame_;
   robot_pose.header.stamp = rclcpp::Time(0);
-  tf2_buffer_->transform(robot_pose, robot_pose, frame);
+  if (tf2_buffer_) {
+    try
+    {
+      tf2_buffer_->transform(robot_pose, robot_pose, frame);
+    }
+    catch(const std::exception& e)
+    {
+      std::cerr << e.what() << '\n';
+      RCLCPP_ERROR(get_logger(), "Failed to get robot pose with frame %s", base_frame_.c_str());
+    }
+  }
   return robot_pose;
 }
+
+geometry_msgs::msg::PoseStamped DockingServer::getRobotPoseInFrame(
+  const std::string & frame, const rclcpp::Time & t)
+{
+  geometry_msgs::msg::PoseStamped robot_pose;
+  // robot_pose.header.frame_id = base_frame_;
+  robot_pose.header.frame_id = "base_link";
+  robot_pose.header.stamp = t;
+  if (tf2_buffer_) {
+    try
+    {
+      tf2_buffer_->transform(robot_pose, robot_pose, frame);
+    }
+    catch(const std::exception& e)
+    {
+      std::cerr << e.what() << '\n';
+      RCLCPP_ERROR(get_logger(), "Failed to get robot pose with frame %s", base_frame_.c_str());
+    }
+  }
+  return robot_pose;
+}
+
 
 void DockingServer::publishZeroVelocity()
 {
@@ -1383,13 +1498,12 @@ void DockingServer::publishZeroVelocity()
 
 void DockingServer::publishDockingFeedback(uint16_t state)
 {
-  auto feedback = std::make_shared<DockRobot::Feedback>();
-  feedback->state = state;
-  feedback->docking_time = this->now() - action_start_time_;
-  feedback->num_retries = num_retries_;
-  
   if (current_docking_request_type_ == DockingRequestType::ACTION) {
     if (!docking_action_server_ || !docking_action_server_->is_server_active()) {
+      auto feedback = std::make_shared<DockRobot::Feedback>();
+      feedback->state = state;
+      feedback->docking_time = this->now() - action_start_time_;
+      feedback->num_retries = num_retries_;
       docking_action_server_->publish_feedback(feedback);
     }
   }
@@ -1581,6 +1695,7 @@ bool DockingServer::saveDockPose() {
   out << yaml_file;
   std::ofstream fout(dock_yaml_filepath_);
   fout << out.c_str();
+  fout << std::endl;
   fout.close();
   RCLCPP_WARN(get_logger(),
     "Save dock pose successfully." \

@@ -110,6 +110,7 @@ protected:
   void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr state);
 
   // Optionally subscribe to a detected dock pose topic
+  std::string detected_dock_pose_topic_ = "detected_dock_pose";
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr dock_pose_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dock_pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr filtered_dock_pose_pub_;
