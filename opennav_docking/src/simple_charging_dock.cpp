@@ -163,8 +163,8 @@ void SimpleChargingDock::configure(
     dock_pose_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
       detected_dock_pose_topic_, 1,
       [this](const geometry_msgs::msg::PoseStamped::SharedPtr pose) {
-        // RCLCPP_WARN_ONCE(node_->get_logger(), "Received dock pose from topic '%s', this msg appears only once",
-        //   detected_dock_pose_topic_.c_str());
+        RCLCPP_WARN_ONCE(node_->get_logger(), "Received dock pose from topic '%s', this msg appears only once",
+          detected_dock_pose_topic_.c_str());
         // RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
         //   "Received detected dock pose from topic '%s', pose: (%.2f, %.2f, %.2f), yaw: %.2f, frame: %s",
         //   detected_dock_pose_topic_.c_str(),
@@ -328,10 +328,12 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   geometry_msgs::msg::PoseStamped detected = detected_dock_pose_;
 
   // Validate that external pose is new enough
-  auto timeout = rclcpp::Duration::from_seconds(external_detection_timeout_);
-  if (node_->now() - detected.header.stamp > timeout) {
-    RCLCPP_WARN(node_->get_logger(),
-      "Lost detection or did not detect: timeout (%.2f sec) exceeded, using default dock pose", external_detection_timeout_);
+  auto time_diff = (node_->now() - detected.header.stamp).seconds();
+  if (time_diff > external_detection_timeout_) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+      "Lost detection or did not detect with time: %.2f, timeout: %.2f exceeded, using default dock pose",
+      time_diff,
+      external_detection_timeout_);
     // return false;
     // TODO
     dock_pose_pub_->publish(pose);
