@@ -372,10 +372,13 @@ void DockingServer::dockingStartStopCallback(const std_msgs::msg::Bool::SharedPt
           RCLCPP_INFO(get_logger(), "docking thread start");
           publishDockingStatus("docking start");
           doDocking();
-          docking_action_state_ = DockingActionState::IDLE;
           RCLCPP_INFO(get_logger(), "docking thread stop");
-          publishDockingStatus("IDLE");
-          publishDockingStatus("docking completed");
+          if (docking_continue_)
+          {
+            docking_action_state_ = DockingActionState::IDLE;
+            publishDockingStatus("IDLE");
+            publishDockingStatus("docking completed");
+          }
         });
       }
     } else {
@@ -493,8 +496,6 @@ void DockingServer::doDocking() {
         dist_dock2staging, dist_dock2robot
       );
 
-      // TODO: decrease xy_goal_tolerance
-      // /controller_server general_goal_checker.xy_goal_tolerance
       navigator_->goToPose(
         initial_staging_pose, rclcpp::Duration::from_seconds(max_staging_time_));
       robot_pose = getRobotPoseInFrame(initial_staging_pose.header.frame_id);
@@ -504,6 +505,13 @@ void DockingServer::doDocking() {
     }
 
     RCLCPP_INFO(get_logger(), "Staging dock robot success");
+    
+    if (!docking_continue_)
+    {
+      RCLCPP_INFO(get_logger(), "Docking cancelled");
+      publishZeroVelocity();
+      return;
+    }
     
     // Construct initial estimate of where the dock is located in fixed_frame
     auto dock_pose = utils::getDockPoseStamped(dock, rclcpp::Time(0));
@@ -1624,6 +1632,7 @@ void DockingServer::publishDiagnostics(std::string diag_val) {
 }
 
 void DockingServer::publishDockingStatus(std::string status) {
+  RCLCPP_INFO(get_logger(), "Docking state: %s", status.c_str());
   if (docking_status_pub_) {
     std_msgs::msg::String str_msg;
     str_msg.data = status;

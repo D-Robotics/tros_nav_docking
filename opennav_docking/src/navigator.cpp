@@ -70,13 +70,35 @@ void Navigator::goToPose(
       future_goal_handle, 2s) == rclcpp::FutureReturnCode::SUCCESS)
   {
     auto future_result = nav_to_pose_client_->async_get_result(future_goal_handle.get());
-    if (executor_.spin_until_future_complete(
-        future_result, timeout) == rclcpp::FutureReturnCode::SUCCESS)
+    auto ret = executor_.spin_until_future_complete(
+        future_result, timeout);
+    // enum class FutureReturnCode {SUCCESS, INTERRUPTED, TIMEOUT};
+    if (ret == rclcpp::FutureReturnCode::SUCCESS)
     {
       auto result = future_result.get();
+      // UNKNOWN = action_msgs::msg::GoalStatus::STATUS_UNKNOWN,
+      // SUCCEEDED = action_msgs::msg::GoalStatus::STATUS_SUCCEEDED,
+      // CANCELED = action_msgs::msg::GoalStatus::STATUS_CANCELED,
+      // ABORTED = action_msgs::msg::GoalStatus::STATUS_ABORTED
       if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+        RCLCPP_INFO(node_.lock()->get_logger(), "Navigation SUCCEEDED.");
         return;  // Success!
+      } else if (result.code == rclcpp_action::ResultCode::ABORTED) {
+        RCLCPP_WARN(node_.lock()->get_logger(), "Navigation ABORTED");
+        return;
+      } else if (result.code == rclcpp_action::ResultCode::CANCELED) {
+        RCLCPP_WARN(node_.lock()->get_logger(), "Navigation CANCELED");
+        return;
+      } else if (result.code == rclcpp_action::ResultCode::UNKNOWN) {
+        RCLCPP_WARN(node_.lock()->get_logger(), "Navigation UNKNOWN");
+        return;
       }
+    } else if (ret == rclcpp::FutureReturnCode::INTERRUPTED)
+    {
+      RCLCPP_WARN(node_.lock()->get_logger(), "Navigation INTERRUPTED.");
+    } else if (ret == rclcpp::FutureReturnCode::TIMEOUT)
+    {
+      RCLCPP_WARN(node_.lock()->get_logger(), "Navigation TIMEOUT.");
     }
   }
 
